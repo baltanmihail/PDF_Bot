@@ -1,0 +1,31 @@
+# Конфигурация с токеном бота
+config.py
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+.venv
+
+# Временные файлы
+*.tmp
+*.temp
+*.log
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Временные директории бота
+pdf_bot_*/
+
+# Локальные данные веб-приложения (БД, PDF)
+data/
+
