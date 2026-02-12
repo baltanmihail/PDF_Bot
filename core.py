@@ -2,6 +2,10 @@
 Ядро логики объединения Word → PDF.
 Используется ботом (main.py) и веб-приложением (web_app.py).
 Конвертация: Windows — Microsoft Word (COM), Linux/сервер — LibreOffice.
+Для максимального совпадения форматирования с Word на сервере включены
+настройки экспорта PDF (качество, шрифты, подавление пустых страниц) и
+шрифты Liberation (метрически совместимы с Arial/Times). Идеальное
+совпадение «как в Word» даёт только конвертация через Word (Windows).
 """
 
 import os
@@ -189,15 +193,26 @@ def _convert_word_win(word_path: Path, pdf_path: Path) -> bool:
 
 
 def _convert_word_libre(word_path: Path, pdf_path: Path, libreoffice_path: Optional[str] = None) -> bool:
-    """Конвертация через LibreOffice (Linux / сервер / при необходимости Windows)."""
+    """Конвертация через LibreOffice с настройками для максимального сохранения форматирования."""
     cmd = libreoffice_path or "libreoffice"
     out_dir = pdf_path.parent
+    # Параметры экспорта: макс. качество изображений, без уменьшения разрешения,
+    # встраивание шрифтов, подавление пустых страниц — для сохранения полей и разметки
+    pdf_filter = (
+        "pdf:writer_pdf_Export:"
+        '{"Quality":{"type":"long","value":"100"},'
+        '"UseLosslessCompression":{"type":"boolean","value":"true"},'
+        '"ReduceImageResolution":{"type":"boolean","value":"false"},'
+        '"IsSkipEmptyPages":{"type":"boolean","value":"true"},'
+        '"EmbedStandardFonts":{"type":"boolean","value":"true"}'
+        "}"
+    )
     try:
         subprocess.run(
             [
                 cmd,
                 "--headless",
-                "--convert-to", "pdf",
+                "--convert-to", pdf_filter,
                 "--outdir", str(out_dir),
                 str(word_path.absolute()),
             ],
