@@ -1,13 +1,31 @@
 # Запуск на Railway с нуля
 
-```powershell
+Пошаговая инструкция: от репозитория до работающего сайта с аккаунтами и хранением PDF.
+
+---
+
+```bash
 git add .
-git status
-git commit -m "Коммит 1"
+git commit -m "описание изменений"
 git push
 ```
 
-Пошаговая инструкция: от репозитория до работающего сайта с аккаунтами и хранением PDF.
+## Чеклист после деплоя (обязательно)
+
+Если контейнер уже запустился, но нужны аккаунты и сохранение файлов:
+
+1. **Volume**  
+   В сервисе: **Settings** → **Volumes** → **Add Volume**.  
+   Mount Path: **`/data`**.
+
+2. **Переменные (Variables)**  
+   В сервисе: **Variables** → **Add Variable** (или **Raw Editor**). Добавьте:
+   - `SECRET_KEY` = длинная случайная строка (например: `python -c "import secrets; print(secrets.token_urlsafe(32))"`).
+   - `DATA_DIR` = `/data/outputs`
+   - `DB_PATH` = `/data/auth.db`
+
+3. **Перезапуск**  
+   После добавления тома и переменных нажмите **Redeploy** (или новый деплой через **Deploy**).
 
 ---
 
@@ -48,7 +66,8 @@ git push
 
 ## 4. Сборка и запуск
 
-- Если используется **Dockerfile**: Railway соберёт образ (Python + LibreOffice) и запустит `uvicorn web_app:app --host 0.0.0.0 --port $PORT`.
+- Приложение запускается как `python web_app.py` и само читает порт из переменной **PORT** (Railway задаёт её автоматически).
+- Если используется **Dockerfile**: Railway соберёт образ (Python + LibreOffice) и запустит приложение.
 - Если без Dockerfile (только Procfile): в сервисе должен быть выбран **Stack** с поддеркой Python; на Railway при наличии `Procfile` часто используют Nixpacks. Тогда **LibreOffice не будет установлен** — конвертация Word не заработает. Имеет смысл оставить **Dockerfile** как основной способ деплоя.
 
 После деплоя Railway покажет URL вида `https://your-app.up.railway.app`.
