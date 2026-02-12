@@ -89,9 +89,13 @@ LOGIN_PAGE = """
         .tabs button.active { background: #0d6efd; color: white; border-color: #0d6efd; }
         #regForm { display: none; }
         .err { color: #c00; font-size: 0.9rem; margin-top: 0.5rem; }
+        .toast-box { position: fixed; top: 1rem; right: 1rem; z-index: 9999; max-width: 320px; }
+        .toast { background: #dc3545; color: #fff; padding: 0.75rem 1rem; border-radius: 8px; margin-bottom: 0.5rem; box-shadow: 0 4px 12px rgba(0,0,0,0.2); animation: toastIn 0.25s ease; }
+        @keyframes toastIn { from { opacity: 0; transform: translateX(100%); } to { opacity: 1; transform: translateX(0); } }
     </style>
 </head>
 <body>
+    <div id="toastBox" class="toast-box" aria-live="polite"></div>
     <h1>Объединение Word в PDF</h1>
     <p style="color:#666; margin-bottom: 1.5rem;">Логин — часть email до @ (например <code>ivan</code> из ivan@gmail.com). Пароль задаёте сами.</p>
     <div class="tabs">
@@ -123,10 +127,18 @@ LOGIN_PAGE = """
         <button type="submit" class="primary">Зарегистрироваться</button>
     </form>
     <script>
+        function showToast(msg) {
+            var box = document.getElementById('toastBox');
+            var el = document.createElement('div');
+            el.className = 'toast';
+            el.textContent = msg;
+            box.appendChild(el);
+            setTimeout(function() { el.remove(); }, 5000);
+        }
         document.getElementById('tabLogin').onclick = function() { document.getElementById('loginForm').style.display = 'block'; document.getElementById('regForm').style.display = 'none'; this.classList.add('active'); document.getElementById('tabReg').classList.remove('active'); };
         document.getElementById('tabReg').onclick = function() { document.getElementById('regForm').style.display = 'block'; document.getElementById('loginForm').style.display = 'none'; this.classList.add('active'); document.getElementById('tabLogin').classList.remove('active'); };
-        document.getElementById('loginForm').onsubmit = function(e) { e.preventDefault(); var fd = new FormData(this); fetch('/login', { method: 'POST', body: fd }).then(r => r.json()).then(d => { if (d.ok) window.location = '/'; else document.getElementById('loginErr').textContent = d.error || 'Ошибка'; }).catch(() => document.getElementById('loginErr').textContent = 'Ошибка сети'); };
-        document.getElementById('regForm').onsubmit = function(e) { e.preventDefault(); var fd = new FormData(this); fetch('/register', { method: 'POST', body: fd }).then(r => r.json()).then(d => { if (d.ok) window.location = '/'; else document.getElementById('regErr').textContent = d.error || 'Ошибка'; }).catch(() => document.getElementById('regErr').textContent = 'Ошибка сети'); });
+        document.getElementById('loginForm').onsubmit = function(e) { e.preventDefault(); var fd = new FormData(this); fetch('/login', { method: 'POST', body: fd }).then(function(r) { return r.json(); }).then(function(d) { if (d.ok) window.location = '/'; else showToast(d.error || 'Ошибка'); }).catch(function() { showToast('Ошибка сети'); }); };
+        document.getElementById('regForm').onsubmit = function(e) { e.preventDefault(); var fd = new FormData(this); fetch('/register', { method: 'POST', body: fd }).then(function(r) { return r.json(); }).then(function(d) { if (d.ok) window.location = '/'; else showToast(d.error || 'Ошибка'); }).catch(function() { showToast('Ошибка сети'); }); };
     </script>
 </body>
 </html>
