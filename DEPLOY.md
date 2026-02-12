@@ -6,7 +6,7 @@
 
 ```bash
 git add .
-git commit -m "описание изменений"
+git commit -m "Деплой 2"
 git push
 ```
 
@@ -60,7 +60,21 @@ git push
      python -c "import secrets; print(secrets.token_urlsafe(32))"
      ```
 
-Переменная `PORT` на Railway задаётся автоматически, менять не нужно.
+Переменная `PORT` на Railway задаётся автоматически. В репозитории есть **railway.json** с командой запуска `python web_app.py` (приложение само читает `PORT` из окружения), чтобы не возникала ошибка `Invalid value for '--port': '$PORT'`.
+
+---
+
+## 3a. Если в логах ошибка «Invalid value for '--port': '$PORT'»
+
+Railway мог подставить свою команду запуска (uvicorn с `$PORT`). Сделайте одно из двух:
+
+1. **Через репозиторий:** В проекте должен быть файл **railway.json** с `"startCommand": "python web_app.py"`. Сделайте коммит и пуш — при следующем деплое команда подхватится.
+
+2. **Вручную в Railway:** Сервис → **Settings** (или **Variables** рядом) → раздел **Deploy** / **Start Command** → в поле команды впишите:
+   ```bash
+   python web_app.py
+   ```
+   Сохраните и нажмите **Redeploy**.
 
 ---
 
