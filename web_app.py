@@ -34,6 +34,7 @@ from auth_db import (
     get_job,
     get_user_jobs,
     get_user_storage_dir,
+    delete_job,
 )
 
 # Логи в память для страницы /logs (последние 200 строк)
@@ -539,7 +540,10 @@ HTML_PAGE = """
             if (data.detail && data.detail === 'not_authenticated') { list.style.display = 'none'; none.style.display = 'block'; return; }
             if (!data.files || data.files.length === 0) { list.style.display = 'none'; none.style.display = 'block'; return; }
             list.style.display = 'block'; none.style.display = 'none';
-            list.innerHTML = data.files.map(f => '<div style="margin:0.35rem 0;"><a href="/download/' + f.job_id + '">' + escapeHtml(f.filename) + '</a>' + (f.total_pages ? ' · ' + f.total_pages + ' стр.' : '') + ' <span style="color:#888;font-size:0.85rem">' + (f.created_at || '') + '</span></div>').join('');
+            list.innerHTML = data.files.map(f => '<div class="my-file-row" style="margin:0.35rem 0;display:flex;align-items:center;gap:0.5rem;"><a href="/download/' + f.job_id + '">' + escapeHtml(f.filename) + '</a>' + (f.total_pages ? ' · ' + f.total_pages + ' стр.' : '') + ' <span style="color:#888;font-size:0.85rem">' + (f.created_at || '') + '</span><button type="button" class="del-job" data-job-id="' + escapeHtml(f.job_id) + '" title="Удалить из списка и освободить место" style="margin-left:auto;padding:0.2rem 0.5rem;font-size:0.8rem;color:#c00;border:1px solid #c00;border-radius:4px;background:#fff;cursor:pointer;">Удалить</button></div>').join('');
+            list.querySelectorAll('.del-job').forEach(function(btn) {
+                btn.onclick = function() { if (!confirm('Удалить этот файл из «Мои файлы»? Файл будет удалён с сервера.')) return; var jid = btn.getAttribute('data-job-id'); fetch('/api/jobs/' + jid, { method: 'DELETE' }).then(r => r.json()).then(function(d) { if (d.ok) { btn.closest('.my-file-row').remove(); var rows = list.querySelectorAll('.my-file-row'); if (rows.length === 0) { list.style.display = 'none'; none.style.display = 'block'; } } else { alert(d.error || 'Ошибка'); } }).catch(function() { alert('Ошибка сети'); }); };
+            });
         }).catch(() => { document.getElementById('myFilesNone').style.display = 'block'; document.getElementById('myFilesList').style.display = 'none'; });
     </script>
 </body>
@@ -612,6 +616,17 @@ def api_my_files(request: Request):
         return JSONResponse({"detail": "not_authenticated", "files": []}, status_code=200)
     files = get_user_jobs(uid)
     return JSONResponse({"files": [{"job_id": f["job_id"], "filename": f["filename"], "total_pages": f.get("total_pages"), "created_at": (f.get("created_at") or "")[:19]} for f in files]})
+
+
+@app.delete("/api/jobs/{job_id}")
+def api_delete_job(request: Request, job_id: str):
+    uid = get_current_user_id(request)
+    if uid is None:
+        return JSONResponse({"ok": False, "error": "Войдите в аккаунт"}, status_code=401)
+    ok, err = delete_job(uid, job_id)
+    if not ok:
+        return JSONResponse({"ok": False, "error": err or "Ошибка"}, status_code=404)
+    return JSONResponse({"ok": True})
 
 
 @app.get("/logs", response_class=HTMLResponse)

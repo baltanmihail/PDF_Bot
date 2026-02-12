@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Optional, List, Tuple, Any
 from contextlib import contextmanager
 
-from passlib.hash import bcrypt
+import bcrypt
 from itsdangerous import URLSafeTimedSerializer, BadSignature
 
 # SECRET_KEY из env для подписи сессии
@@ -22,11 +22,17 @@ serializer = URLSafeTimedSerializer(SECRET_KEY, salt="session")
 
 
 def get_password_hash(password: str) -> str:
-    return bcrypt.hash(password)
+    # bcrypt принимает не более 72 байт
+    pwd_bytes = password.encode("utf-8")[:72]
+    return bcrypt.hashpw(pwd_bytes, bcrypt.gensalt()).decode("ascii")
 
 
 def verify_password(plain: str, hashed: str) -> bool:
-    return bcrypt.verify(plain, hashed)
+    try:
+        pwd_bytes = plain.encode("utf-8")[:72]
+        return bcrypt.checkpw(pwd_bytes, hashed.encode("ascii"))
+    except Exception:
+        return False
 
 
 def create_session(user_id: int) -> str:
@@ -142,3 +148,22 @@ def get_user_storage_dir(user_id: int) -> Path:
     d = DATA_DIR / str(user_id)
     d.mkdir(parents=True, exist_ok=True)
     return d
+
+
+def delete_job(user_id: int, job_id: str) -> Tuple[bool, Optional[str]]:
+    """Удаляет запись из jobs и файл на диске (если есть). Возвращает (True, None) или (False, сообщение об ошибке)."""
+    with _db() as conn:
+        row = conn.execute(
+            "SELECT file_path FROM jobs WHERE user_id = ? AND job_id = ?",
+            (user_id, job_id),
+        ).fetchone()
+        if not row:
+            return False, "Запись не найдена"
+        file_path = row["file_path"]
+        conn.execute("DELETE FROM jobs WHERE user_id = ? AND job_id = ?", (user_id, job_id))
+    if file_path:
+        try:
+            Path(file_path).unlink(missing_ok=True)
+        except Exception as e:
+            pass  # запись уже удалена, файл по возможности удалён позже
+    return True, None
