@@ -4,8 +4,12 @@
 """
 
 import logging
+import os
 import shutil
 import tempfile
+import urllib.error
+import urllib.parse
+import urllib.request
 import uuid
 from pathlib import Path
 from threading import Thread
@@ -178,9 +182,16 @@ def _run_job(job_id: str, zip_path: Optional[Path], folder_path: Optional[Path],
             )
 
         if not ok:
+            err_msg = "Не удалось создать PDF." + (" Не конвертированы: " + ", ".join(failed[:8]) + ("…" if len(failed) > 8 else "") if failed else "")
             jobs[job_id]["stage"] = "error"
-            jobs[job_id]["error"] = "Не удалось создать PDF." + (" Не конвертированы: " + ", ".join(failed[:5]) if failed else "")
+            jobs[job_id]["error"] = err_msg
+            jobs[job_id]["done"] = True
+            logger.warning("Job %s failed: %s", job_id, err_msg)
             return
+        if failed:
+            jobs[job_id]["warning"] = "Часть файлов не конвертирована: " + ", ".join(failed[:6]) + ("… (всего " + str(len(failed)) + ")" if len(failed) > 6 else "")
+            jobs[job_id]["failed_files"] = failed
+            logger.warning("Job %s partial: %s", job_id, jobs[job_id]["warning"])
         user_id = jobs[job_id].get("user_id")
         if user_id:
             dest_dir = get_user_storage_dir(user_id)
@@ -237,8 +248,16 @@ def _run_job_from_preview(job_id: str, work_dir: Path, order: List[int], sorted_
         )
         if not ok:
             jobs[job_id]["stage"] = "error"
-            jobs[job_id]["error"] = "Не удалось создать PDF." + (" Не конвертированы: " + ", ".join(failed[:5]) if failed else "")
+            err_msg = "Не удалось создать PDF." + (" Не конвертированы: " + ", ".join(failed[:8]) + ("…" if len(failed) > 8 else "") if failed else "")
+            jobs[job_id]["error"] = err_msg
+            jobs[job_id]["done"] = True
+            logger.warning("Job %s failed: %s", job_id, err_msg)
             return
+        if failed:
+            warning = "Часть файлов не конвертирована: " + ", ".join(failed[:6]) + ("… (всего " + str(len(failed)) + ")" if len(failed) > 6 else "")
+            jobs[job_id]["warning"] = warning
+            jobs[job_id]["failed_files"] = failed
+            logger.warning("Job %s partial: %s", job_id, warning)
         dest_dir = get_user_storage_dir(user_id)
         safe_name = out_filename
         dest = dest_dir / safe_name
@@ -334,6 +353,7 @@ HTML_PAGE = """
     </div>
 
     <div id="preview">
+        <p id="previewSource" class="preview-source" style="margin:0 0 0.5rem 0;font-size:0.9rem;color:#555;"></p>
         <div class="preview-title">Проверьте порядок файлов (при ошибке в названии переместите или удалите лишние)</div>
         <div class="preview-list" id="previewList"></div>
         <button type="button" class="primary btn-convert" id="btnStartConvert">Начать конвертацию</button>
@@ -412,12 +432,21 @@ HTML_PAGE = """
                     document.getElementById('downloadLink').innerHTML = '<a class="primary" href="/download/' + jobId + '" style="display:inline-block;padding:0.5rem 1rem;text-decoration:none;border-radius:8px;">Скачать PDF</a>';
                     document.getElementById('btnZip').disabled = false;
                     document.getElementById('btnFolder').disabled = false;
+                    document.getElementById('btnStartConvert').disabled = false;
+                    if (data.warning || (data.failed_files && data.failed_files.length > 0)) {
+                        var shortMsg = data.warning_short || (data.failed_files ? 'Не конвертировано ' + data.failed_files.length + ' файлов. PDF может быть неполным.' : data.warning);
+                        showToast(shortMsg);
+                    }
+                    document.getElementById('errorMsg').style.display = 'none';
                     return;
                 } else if (data.stage === 'error') {
-                    document.getElementById('errorMsg').textContent = data.error || 'Ошибка';
+                    var errText = data.error || 'Ошибка конвертации';
+                    showToast(errText);
+                    document.getElementById('errorMsg').textContent = errText;
                     document.getElementById('errorMsg').style.display = 'block';
                     document.getElementById('btnZip').disabled = false;
                     document.getElementById('btnFolder').disabled = false;
+                    document.getElementById('btnStartConvert').disabled = false;
                     return;
                 }
                 setTimeout(f, 400);
@@ -449,15 +478,19 @@ HTML_PAGE = """
             });
         }
 
-        function showPreview(jobId, files) {
+        function showPreview(jobId, files, sourceLabel) {
             currentPreviewJobId = jobId;
             currentPreviewFiles = files.slice();
+            var srcEl = document.getElementById('previewSource');
+            if (sourceLabel) { srcEl.textContent = 'Источник: ' + sourceLabel; srcEl.style.display = ''; } else { srcEl.textContent = ''; srcEl.style.display = 'none'; }
             document.getElementById('progress').classList.remove('visible');
             document.getElementById('preview').classList.add('visible');
             document.getElementById('errorMsg').style.display = 'none';
             renderPreviewList();
             document.getElementById('btnZip').disabled = false;
             document.getElementById('btnFolder').disabled = false;
+            document.getElementById('fileZip').value = '';
+            document.getElementById('fileFolder').value = '';
         }
 
         function upload(formData, isFolder) {
@@ -471,7 +504,7 @@ HTML_PAGE = """
                 .then(data => {
                     if (data.detail) { document.getElementById('errorMsg').textContent = data.detail; document.getElementById('errorMsg').style.display = 'block'; document.getElementById('btnZip').disabled = false; document.getElementById('btnFolder').disabled = false; return; }
                     if (data.stage === 'preview' && data.files && data.files.length) {
-                        showPreview(data.job_id, data.files);
+                        showPreview(data.job_id, data.files, data.source_label || '');
                         return;
                     }
                     if (data.job_id) poll(data.job_id);
@@ -488,6 +521,8 @@ HTML_PAGE = """
         document.getElementById('btnStartConvert').onclick = function() {
             if (!currentPreviewJobId || !currentPreviewFiles.length) { alert('Нет файлов для конвертации'); return; }
             var order = currentPreviewFiles.map(function(f) { return f.index; });
+            if (order.length === 0) { alert('Добавьте хотя бы один файл в список'); return; }
+            document.getElementById('btnStartConvert').disabled = true;
             document.getElementById('preview').classList.remove('visible');
             showProgress(true);
             setProgress(0, 'Подготовка…', '', [], null, null);
@@ -496,7 +531,7 @@ HTML_PAGE = """
             fetch('/convert/' + currentPreviewJobId, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ order: order }) })
                 .then(r => r.json())
                 .then(data => {
-                    if (data.detail) { document.getElementById('errorMsg').textContent = data.detail; document.getElementById('errorMsg').style.display = 'block'; document.getElementById('btnZip').disabled = false; document.getElementById('btnFolder').disabled = false; return; }
+                    if (data.detail) { document.getElementById('errorMsg').textContent = data.detail; document.getElementById('errorMsg').style.display = 'block'; document.getElementById('btnZip').disabled = false; document.getElementById('btnFolder').disabled = false; document.getElementById('btnStartConvert').disabled = false; return; }
                     poll(currentPreviewJobId);
                 })
                 .catch(e => {
@@ -504,6 +539,7 @@ HTML_PAGE = """
                     document.getElementById('errorMsg').style.display = 'block';
                     document.getElementById('btnZip').disabled = false;
                     document.getElementById('btnFolder').disabled = false;
+                    document.getElementById('btnStartConvert').disabled = false;
                 });
         };
 
@@ -598,6 +634,92 @@ def logout():
     return r
 
 
+@app.get("/connect")
+def connect_microsoft(request: Request):
+    """Редирект на вход Microsoft для получения refresh_token (личный аккаунт M365)."""
+    client_id = os.environ.get("MS_GRAPH_CLIENT_ID")
+    if not client_id:
+        return HTMLResponse(
+            "<!DOCTYPE html><html><head><meta charset='utf-8'></head><body>"
+            "<p>Сначала добавьте переменную <code>MS_GRAPH_CLIENT_ID</code> в Railway (Variables) и сделайте Redeploy.</p>"
+            "<p><a href='/'>На главную</a></p></body></html>",
+            status_code=400,
+        )
+    base = str(request.base_url).rstrip("/")
+    redirect_uri = base + "/connect/callback"
+    scope = "https://graph.microsoft.com/Files.ReadWrite offline_access"
+    url = (
+        "https://login.microsoftonline.com/common/oauth2/v2.0/authorize?"
+        + urllib.parse.urlencode({
+            "client_id": client_id,
+            "response_type": "code",
+            "redirect_uri": redirect_uri,
+            "scope": scope,
+        })
+    )
+    return RedirectResponse(url=url, status_code=302)
+
+
+@app.get("/connect/callback", response_class=HTMLResponse)
+def connect_callback(request: Request, code: Optional[str] = None, error: Optional[str] = None):
+    """После входа Microsoft: обмен code на токены, показ refresh_token для вставки в Railway."""
+    if error:
+        return HTMLResponse(
+            f"<html><body><p>Ошибка входа: {error}</p><p><a href='/connect'>Повторить</a> | <a href='/'>На главную</a></p></body></html>",
+            status_code=400,
+        )
+    if not code:
+        return HTMLResponse("<html><body><p>Нет кода от Microsoft.</p><p><a href='/connect'>К странице входа</a></p></body></html>", status_code=400)
+    client_id = os.environ.get("MS_GRAPH_CLIENT_ID")
+    client_secret = os.environ.get("MS_GRAPH_CLIENT_SECRET")
+    if not client_id or not client_secret:
+        return HTMLResponse("<html><body><p>Не заданы MS_GRAPH_CLIENT_ID или MS_GRAPH_CLIENT_SECRET.</p><p><a href='/'>На главную</a></p></body></html>", status_code=500)
+    base = str(request.base_url).rstrip("/").replace("/connect/callback", "")
+    redirect_uri = base + "/connect/callback"
+    data = urllib.parse.urlencode({
+        "client_id": client_id,
+        "client_secret": client_secret,
+        "code": code,
+        "redirect_uri": redirect_uri,
+        "grant_type": "authorization_code",
+    }).encode()
+    req = urllib.request.Request(
+        "https://login.microsoftonline.com/common/oauth2/v2.0/token",
+        data=data,
+        method="POST",
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            import json
+            j = json.loads(resp.read().decode())
+            refresh = j.get("refresh_token")
+            if not refresh:
+                return HTMLResponse(
+                    "<html><body><p>Microsoft не вернул refresh_token. Убедитесь, что в разрешениях приложения есть offline_access.</p>"
+                    "<p><a href='/connect'>Повторить</a> | <a href='/'>На главную</a></p></body></html>",
+                    status_code=400,
+                )
+            return HTMLResponse(
+                "<!DOCTYPE html><html><head><meta charset='utf-8'><title>Refresh-токен</title></head><body>"
+                "<h2>Скопируйте refresh_token в Railway</h2>"
+                "<p>В Railway → ваш сервис → <strong>Variables</strong> добавьте переменную:</p>"
+                "<p><code>MS_GRAPH_REFRESH_TOKEN</code> = значение ниже (целиком).</p>"
+                "<textarea readonly style='width:100%;height:120px;font-size:12px'>" + refresh + "</textarea>"
+                "<p>После сохранения переменной нажмите <strong>Redeploy</strong>. Конвертация Word → PDF будет идти через ваш OneDrive (точное форматирование).</p>"
+                "<p><a href='/'>На главную</a></p></body></html>"
+            )
+    except urllib.error.HTTPError as e:
+        body = e.read().decode()[:500]
+        return HTMLResponse(
+            f"<html><body><p>Ошибка обмена кода: {e.code}</p><pre>{body}</pre>"
+            "<p><a href='/connect'>Повторить</a> | <a href='/'>На главную</a></p></body></html>",
+            status_code=400,
+        )
+    except Exception as e:
+        return HTMLResponse(f"<html><body><p>Ошибка: {e}</p><p><a href='/'>На главную</a></p></body></html>", status_code=500)
+
+
 @app.get("/api/me")
 def api_me(request: Request):
     uid = get_current_user_id(request)
@@ -648,7 +770,14 @@ def _cleanup(path: Path) -> None:
         pass
 
 
-def _make_preview_response(job_id: str, sorted_files: List[Path], out_filename: str, work_dir: Path, user_id: int):
+def _make_preview_response(
+    job_id: str,
+    sorted_files: List[Path],
+    out_filename: str,
+    work_dir: Path,
+    user_id: int,
+    source_label: Optional[str] = None,
+):
     files = [{"index": i, "name": p.name, "page": extract_page_number(p.name)} for i, p in enumerate(sorted_files)]
     jobs[job_id] = {
         "stage": "preview",
@@ -658,7 +787,10 @@ def _make_preview_response(job_id: str, sorted_files: List[Path], out_filename: 
         "out_filename": out_filename,
         "total": 0, "current": 0, "current_file": "", "file_names": [], "total_pages": 0, "done": False, "error": None, "pdf_path": None, "filename": out_filename,
     }
-    return {"job_id": job_id, "stage": "preview", "files": files}
+    out = {"job_id": job_id, "stage": "preview", "files": files}
+    if source_label:
+        out["source_label"] = source_label
+    return out
 
 
 @app.post("/upload")
@@ -684,7 +816,20 @@ async def upload(request: Request, file: UploadFile = File(...)):
         shutil.rmtree(work_dir, ignore_errors=True)
         raise HTTPException(status_code=422, detail="В архиве не найдено .doc/.docx")
     zip_path.unlink(missing_ok=True)
-    return JSONResponse(_make_preview_response(job_id, sorted_files, suffix + ".pdf", work_dir, user_id))
+    return JSONResponse(
+        _make_preview_response(
+            job_id, sorted_files, suffix + ".pdf", work_dir, user_id,
+            source_label="ZIP: " + (file.filename or "archive.zip"),
+        )
+    )
+
+
+def _sanitize_filename_part(s: str, max_len: int = 50) -> str:
+    """Оставляет только буквы, цифры, пробел, дефис и подчёркивание."""
+    import re
+    s = (s or "").strip()
+    s = re.sub(r"[^\w\s\-]", "", s, flags=re.UNICODE)
+    return s[:max_len].strip() or "merged"
 
 
 @app.post("/upload-folder")
@@ -694,6 +839,13 @@ async def upload_folder(request: Request, files: List[UploadFile] = File(...)):
         raise HTTPException(status_code=401, detail="Войдите в аккаунт")
     if not files:
         raise HTTPException(status_code=400, detail="Выберите папку с файлами")
+    folder_name = "merged"
+    for u in files:
+        name = u.filename or ""
+        if "/" in name or "\\" in name:
+            folder_name = name.replace("\\", "/").split("/")[0].strip()
+            break
+    safe_name = _sanitize_filename_part(folder_name) + ".pdf"
     job_id = str(uuid.uuid4())
     work_dir = Path(tempfile.mkdtemp(prefix="pdf_folder_"))
     written = 0
@@ -711,7 +863,12 @@ async def upload_folder(request: Request, files: List[UploadFile] = File(...)):
         raise HTTPException(status_code=422, detail="В папке не найдено .doc/.docx")
     word_files = get_all_word_files(work_dir)
     sorted_files = sort_files_by_pages(word_files)
-    return JSONResponse(_make_preview_response(job_id, sorted_files, "merged.pdf", work_dir, user_id))
+    return JSONResponse(
+        _make_preview_response(
+            job_id, sorted_files, safe_name, work_dir, user_id,
+            source_label="Папка: " + folder_name,
+        )
+    )
 
 
 @app.post("/convert/{job_id}")
@@ -744,7 +901,7 @@ def progress(job_id: str):
     if job_id not in jobs:
         raise HTTPException(status_code=404, detail="Задание не найдено")
     j = jobs[job_id]
-    return {
+    out = {
         "stage": j["stage"],
         "total": j["total"],
         "current": j["current"],
@@ -754,6 +911,12 @@ def progress(job_id: str):
         "error": j.get("error"),
         "done": j.get("done", False),
     }
+    if j.get("warning"):
+        out["warning"] = j["warning"]
+    if j.get("failed_files"):
+        out["failed_files"] = j["failed_files"]
+        out["warning_short"] = "Не конвертировано " + str(len(j["failed_files"])) + " файлов. PDF может быть неполным."
+    return out
 
 
 @app.get("/download/{job_id}")

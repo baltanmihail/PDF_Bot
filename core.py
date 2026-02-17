@@ -1,17 +1,19 @@
 """
 Ядро логики объединения Word → PDF.
 Используется ботом (main.py) и веб-приложением (web_app.py).
-Конвертация: Windows — Microsoft Word (COM), Linux/сервер — LibreOffice.
-Для максимального совпадения форматирования с Word на сервере включены
-настройки экспорта PDF (качество, шрифты, подавление пустых страниц) и
-шрифты Liberation (метрически совместимы с Arial/Times). Идеальное
-совпадение «как в Word» даёт только конвертация через Word (Windows).
+Конвертация:
+- Windows — Microsoft Word (COM), точное форматирование.
+- Linux/сервер: при заданных MS_GRAPH_* — Microsoft Graph (Word в облаке, точная вёрстка);
+  иначе LibreOffice (настройки и шрифты Liberation для лучшего совпадения).
+См. DEPLOY.md, раздел 6a — настройка Graph для печати.
 """
 
 import os
 import re
 import sys
+import threading
 import time
+import uuid
 import logging
 import shutil
 import zipfile
@@ -19,6 +21,14 @@ import tempfile
 import subprocess
 from pathlib import Path
 from typing import List, Tuple, Optional, Callable
+
+# На Windows Word COM не поддерживает параллельные вызовы — одна конвертация за раз
+_word_com_lock = threading.Lock()
+
+# Для Microsoft Graph (опционально)
+import urllib.request
+import urllib.error
+import urllib.parse
 
 logger = logging.getLogger(__name__)
 
@@ -137,59 +147,62 @@ def copy_file_with_retry(src: Path, dst: Path, max_attempts: int = 15, delay: fl
 
 
 def _convert_word_win(word_path: Path, pdf_path: Path) -> bool:
-    """Конвертация через Microsoft Word (Windows COM)."""
+    """Конвертация через Microsoft Word (Windows COM). Один поток за раз — COM не поддерживает параллельность."""
     try:
         import win32com.client
         import pythoncom
     except ImportError:
         logger.error("pywin32 не установлен")
         return False
-    # COM требует CoInitialize в каждом потоке (веб-приложение вызывает из фонового потока)
-    pythoncom.CoInitialize()
-    try:
-        word = win32com.client.Dispatch("Word.Application")
-        word.Visible = False
+    with _word_com_lock:
+        pythoncom.CoInitialize()
         try:
-            doc = word.Documents.Open(
-                FileName=str(word_path.absolute()),
-                ReadOnly=True,
-                AddToRecentFiles=False,
-                Visible=False,
-            )
+            word = win32com.client.Dispatch("Word.Application")
             try:
-                doc.ExportAsFixedFormat(
-                    str(pdf_path.absolute()),
-                    17,
-                    0,
-                )
+                word.Visible = False
             except Exception:
+                pass  # если Word уже запущен, Visible может быть недоступен — продолжаем без скрытия
+            try:
+                doc = word.Documents.Open(
+                    FileName=str(word_path.absolute()),
+                    ReadOnly=True,
+                    AddToRecentFiles=False,
+                    Visible=False,
+                )
                 try:
                     doc.ExportAsFixedFormat(
-                        OutputFileName=str(pdf_path.absolute()),
-                        ExportFormat=17,
-                        OptimizeFor=0,
+                        str(pdf_path.absolute()),
+                        17,
+                        0,
                     )
                 except Exception:
-                    doc.SaveAs(FileName=str(pdf_path.absolute()), FileFormat=17)
-            doc.Close(SaveChanges=False)
-            return True
+                    try:
+                        doc.ExportAsFixedFormat(
+                            OutputFileName=str(pdf_path.absolute()),
+                            ExportFormat=17,
+                            OptimizeFor=0,
+                        )
+                    except Exception:
+                        doc.SaveAs(FileName=str(pdf_path.absolute()), FileFormat=17)
+                doc.Close(SaveChanges=False)
+                return True
+            except Exception as e:
+                logger.error("Ошибка конвертации %s: %s", word_path, e)
+                try:
+                    doc.Close()
+                except Exception:
+                    pass
+                return False
+            finally:
+                word.Quit()
         except Exception as e:
-            logger.error("Ошибка конвертации %s: %s", word_path, e)
-            try:
-                doc.Close()
-            except Exception:
-                pass
+            logger.error("Word COM: %s", e)
             return False
         finally:
-            word.Quit()
-    except Exception as e:
-        logger.error("Word COM: %s", e)
-        return False
-    finally:
-        try:
-            pythoncom.CoUninitialize()
-        except Exception:
-            pass
+            try:
+                pythoncom.CoUninitialize()
+            except Exception:
+                pass
 
 
 def _convert_word_libre(word_path: Path, pdf_path: Path, libreoffice_path: Optional[str] = None) -> bool:
@@ -232,14 +245,160 @@ def _convert_word_libre(word_path: Path, pdf_path: Path, libreoffice_path: Optio
         return False
 
 
+def _graph_configured() -> bool:
+    """Проверяет, заданы ли переменные для конвертации через Microsoft Graph.
+    Два режима: 1) рабочий аккаунт — tenant + user_id + client_id + secret;
+    2) личный аккаунт — refresh_token + client_id + secret.
+    """
+    cid = os.environ.get("MS_GRAPH_CLIENT_ID")
+    secret = os.environ.get("MS_GRAPH_CLIENT_SECRET")
+    if not cid or not secret:
+        return False
+    if os.environ.get("MS_GRAPH_REFRESH_TOKEN"):
+        return True
+    return bool(os.environ.get("MS_GRAPH_TENANT_ID") and os.environ.get("MS_GRAPH_USER_ID"))
+
+
+def _get_graph_token() -> Optional[str]:
+    """Получает access token: по refresh_token (личный аккаунт) или client credentials (рабочий)."""
+    import json
+    client_id = os.environ.get("MS_GRAPH_CLIENT_ID")
+    client_secret = os.environ.get("MS_GRAPH_CLIENT_SECRET")
+    refresh = os.environ.get("MS_GRAPH_REFRESH_TOKEN", "").strip()
+    if refresh and client_id and client_secret:
+        url = "https://login.microsoftonline.com/common/oauth2/v2.0/token"
+        data = urllib.parse.urlencode({
+            "client_id": client_id,
+            "client_secret": client_secret,
+            "refresh_token": refresh,
+            "grant_type": "refresh_token",
+        }).encode()
+        req = urllib.request.Request(url, data=data, method="POST")
+        req.add_header("Content-Type", "application/x-www-form-urlencoded")
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                j = json.loads(resp.read().decode())
+                return j.get("access_token")
+        except urllib.error.HTTPError as e:
+            logger.error("Graph refresh token error: %s %s", e.code, e.read().decode()[:200])
+            return None
+        except Exception as e:
+            logger.error("Graph refresh token: %s", e)
+            return None
+    tenant = os.environ.get("MS_GRAPH_TENANT_ID")
+    if not all((tenant, client_id, client_secret)):
+        return None
+    url = f"https://login.microsoftonline.com/{tenant}/oauth2/v2.0/token"
+    data = urllib.parse.urlencode({
+        "client_id": client_id,
+        "client_secret": client_secret,
+        "scope": "https://graph.microsoft.com/.default",
+        "grant_type": "client_credentials",
+    }).encode()
+    req = urllib.request.Request(url, data=data, method="POST")
+    req.add_header("Content-Type", "application/x-www-form-urlencoded")
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            j = json.loads(resp.read().decode())
+            return j.get("access_token")
+    except urllib.error.HTTPError as e:
+        logger.error("Graph token error: %s %s", e.code, e.read().decode()[:200])
+        return None
+    except Exception as e:
+        logger.error("Graph token: %s", e)
+        return None
+
+
+def _graph_drive_base() -> str:
+    """Базовый URL для OneDrive: /me/drive (личный) или /users/{id}/drive (рабочий)."""
+    if os.environ.get("MS_GRAPH_REFRESH_TOKEN"):
+        return "https://graph.microsoft.com/v1.0/me/drive/root"
+    user_id = os.environ.get("MS_GRAPH_USER_ID", "").strip()
+    return f"https://graph.microsoft.com/v1.0/users/{user_id}/drive/root"
+
+
+def _convert_word_graph(word_path: Path, pdf_path: Path) -> bool:
+    """
+    Конвертация через Microsoft Graph (Word в облаке).
+    Поддерживает личный аккаунт (refresh_token) и рабочий (tenant + user_id).
+    Файл загружается во временную папку OneDrive, конвертируется в PDF, скачивается.
+    """
+    token = _get_graph_token()
+    if not token:
+        return False
+    ext = word_path.suffix.lower()
+    if ext not in (".doc", ".docx"):
+        return False
+    safe_name = f"AppTemp/{uuid.uuid4().hex}{ext}"
+    drive_base = _graph_drive_base()
+    base = f"{drive_base}:/{safe_name}"
+    headers = {"Authorization": f"Bearer {token}"}
+    # 1) Загрузка файла
+    with open(word_path, "rb") as f:
+        body = f.read()
+    req = urllib.request.Request(
+        f"{base}:/content",
+        data=body,
+        method="PUT",
+        headers={**headers, "Content-Type": "application/octet-stream"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            if resp.status not in (200, 201):
+                return False
+    except urllib.error.HTTPError as e:
+        logger.error("Graph upload: %s %s", e.code, e.read().decode()[:300])
+        return False
+    except Exception as e:
+        logger.error("Graph upload: %s", e)
+        return False
+    # 2) Запрос PDF (Graph возвращает 302 на предподписанный URL; urllib следует редиректу)
+    req2 = urllib.request.Request(
+        f"{base}:/content?format=pdf",
+        method="GET",
+        headers=headers,
+    )
+    try:
+        with urllib.request.urlopen(req2, timeout=120) as resp:
+            pdf_path.write_bytes(resp.read())
+    except urllib.error.HTTPError as e:
+        logger.error("Graph convert: %s %s", e.code, e.read().decode()[:300])
+        try:
+            del_req = urllib.request.Request(f"{base}", method="DELETE", headers=headers)
+            urllib.request.urlopen(del_req, timeout=10)
+        except Exception:
+            pass
+        return False
+    except Exception as e:
+        logger.error("Graph convert: %s", e)
+        try:
+            del_req = urllib.request.Request(f"{base}", method="DELETE", headers=headers)
+            urllib.request.urlopen(del_req, timeout=10)
+        except Exception:
+            pass
+        return False
+    # 3) Удаление временного файла
+    try:
+        del_req = urllib.request.Request(f"{base}", method="DELETE", headers=headers)
+        urllib.request.urlopen(del_req, timeout=10)
+    except Exception:
+        pass
+    return True
+
+
 def convert_word_to_pdf(word_path: Path, pdf_path: Path, use_libreoffice: bool = False) -> bool:
     """
     Конвертирует Word в PDF.
-    Windows по умолчанию — Word (COM); иначе или use_libreoffice=True — LibreOffice.
+    Windows — Microsoft Word (COM). Linux/сервер: при наличии MS_GRAPH_* используется
+    Microsoft Graph (Word в облаке, точное форматирование); иначе LibreOffice.
     """
-    if use_libreoffice or sys.platform != "win32":
-        return _convert_word_libre(word_path, pdf_path)
-    return _convert_word_win(word_path, pdf_path)
+    if sys.platform == "win32" and not use_libreoffice:
+        return _convert_word_win(word_path, pdf_path)
+    if _graph_configured():
+        if _convert_word_graph(word_path, pdf_path):
+            return True
+        logger.warning("Graph conversion failed, falling back to LibreOffice")
+    return _convert_word_libre(word_path, pdf_path)
 
 
 def merge_pdfs(pdf_files: List[Path], output_path: Path) -> Tuple[bool, int]:
